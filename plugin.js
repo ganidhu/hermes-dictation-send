@@ -10,6 +10,10 @@
  *
  * It drives the real composer controls via the DOM. There is no public
  * dictate()/submit() plugin API.
+ *
+ * Profile swaps remount the chat. Always target the focused surface, reset
+ * leftover recording state, and wait briefly if the new composer is still
+ * connecting.
  */
 import {
   KEYBINDS_AREA,
@@ -30,6 +34,7 @@ const $autoSend = atom(true)
 const $phase = atom('idle')
 
 let persistAutoSend = () => {}
+let generation = 0
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -47,12 +52,24 @@ function visible(selector, root = document) {
   return visibleAll(selector, root)[0] ?? null
 }
 
+function activeSurface() {
+  const surfaces = visibleAll('[data-composer-target]')
+  return surfaces.find(el => !el.hasAttribute('data-chat-unfocused')) || surfaces[0] || null
+}
+
 function composerRoot() {
+  const surface = activeSurface()
+  if (surface) {
+    return surface.querySelector('[data-slot="composer-root"]')
+  }
   return visible('[data-slot="composer-root"]')
 }
 
 function composerText() {
-  const editor = visible('[data-slot="composer-rich-input"]')
+  const root = composerRoot()
+  const editor = root
+    ? root.querySelector('[data-slot="composer-rich-input"]')
+    : visible('[data-slot="composer-rich-input"]')
   return (editor?.innerText || '').replace(/\u00a0/g, ' ').trim()
 }
 
@@ -77,7 +94,7 @@ function dictationMenuItem() {
 
 function standaloneDictationButton(root) {
   return (
-    visibleAll('button[aria-pressed][aria-label]', root).find(el =>
+    [...root.querySelectorAll('button[aria-pressed][aria-label]')].find(el =>
       isDictationLabel(el.getAttribute('aria-label'))
     ) || null
   )
@@ -85,17 +102,25 @@ function standaloneDictationButton(root) {
 
 function voiceMenuTrigger(root) {
   return (
-    visibleAll('button[aria-haspopup]', root).find(el =>
+    [...root.querySelectorAll('button[aria-haspopup]')].find(el =>
       isVoiceMenuTrigger(el.getAttribute('aria-label'))
     ) || null
   )
 }
 
 function currentPhase() {
-  const labels = visibleAll('button[aria-label]').map(el =>
+  const root = composerRoot()
+  if (!root) return 'idle'
+  const labels = [...root.querySelectorAll('button[aria-label]')].map(el =>
     (el.getAttribute('aria-label') || '').toLowerCase()
   )
-  if (labels.some(label => label.includes('transcribing dictation') || /transcribing/.test(label) && isDictationLabel(label))) {
+  if (
+    labels.some(
+      label =>
+        label.includes('transcribing dictation') ||
+        (/transcribing/.test(label) && isDictationLabel(label))
+    )
+  ) {
     return 'transcribing'
   }
   if (labels.some(label => label.includes('stop dictation') || (/stop/.test(label) && isDictationLabel(label)))) {
@@ -108,7 +133,7 @@ function sendButton() {
   const root = composerRoot()
   if (!root) return null
   return (
-    visibleAll('button[type="submit"]', root).find(el => {
+    [...root.querySelectorAll('button[type="submit"]')].find(el => {
       const label = (el.getAttribute('aria-label') || '').toLowerCase()
       return label === 'send' || label.includes('send')
     }) || null
@@ -125,37 +150,45 @@ async function waitFor(check, ms) {
   return null
 }
 
-async function toggleDictation() {
+function dictationControl() {
   const root = composerRoot()
-  if (!root) {
-    host.notify({ kind: 'warning', message: 'No composer on screen' })
-    return
-  }
+  if (!root) return null
 
   const openItem = dictationMenuItem()
-  if (openItem) {
-    if (openItem.getAttribute('aria-disabled') === 'true') return
-    haptic('tap')
-    openItem.click()
-    return
+  if (openItem && openItem.getAttribute('aria-disabled') !== 'true') {
+    return { kind: 'item', el: openItem }
   }
 
   const mic = standaloneDictationButton(root)
-  if (mic) {
-    if (mic.disabled) return
-    haptic('tap')
-    mic.click()
-    return
+  if (mic && !mic.disabled) {
+    return { kind: 'mic', el: mic }
   }
 
   const trigger = voiceMenuTrigger(root)
-  if (!trigger || trigger.disabled) {
-    host.notify({ kind: 'warning', message: 'Dictation control not found' })
+  if (trigger && !trigger.disabled) {
+    return { kind: 'menu', el: trigger }
+  }
+
+  return null
+}
+
+async function toggleDictation() {
+  const control = await waitFor(dictationControl, 4000)
+  if (!control) {
+    host.notify({
+      kind: 'warning',
+      message: composerRoot()
+        ? 'Dictation is not ready on this profile yet'
+        : 'No composer on screen',
+    })
     return
   }
 
   haptic('tap')
-  trigger.click()
+  control.el.click()
+
+  if (control.kind !== 'menu') return
+
   const item = await waitFor(dictationMenuItem, 900)
   if (!item || item.getAttribute('aria-disabled') === 'true') {
     host.notify({ kind: 'warning', message: 'Dictation menu item not found' })
@@ -169,10 +202,12 @@ let sending = false
 async function sendAfterStop(before) {
   if (sending) return
   sending = true
+  const gen = generation
   let sawTranscribe = currentPhase() === 'transcribing'
   const started = Date.now()
   try {
     while (true) {
+      if (gen !== generation) return
       if (!$autoSend.get()) return
       const phase = currentPhase()
       if (phase === 'transcribing') sawTranscribe = true
@@ -193,7 +228,7 @@ async function sendAfterStop(before) {
       await wait(40)
     }
   } finally {
-    sending = false
+    if (gen === generation) sending = false
   }
 }
 
@@ -214,6 +249,13 @@ function syncPhase() {
   }
 }
 syncPhase.snapshot = ''
+
+function resetForNewChat() {
+  generation += 1
+  sending = false
+  syncPhase.snapshot = ''
+  $phase.set('idle')
+}
 
 function Chip() {
   const auto = useValue($autoSend)
@@ -261,6 +303,11 @@ function toggleAutoSend() {
   })
 }
 
+function subscribeAtom(atom, fn) {
+  if (!atom || typeof atom.subscribe !== 'function') return () => {}
+  return atom.subscribe(fn)
+}
+
 export default {
   id: ID,
   name: 'Dictation send',
@@ -275,17 +322,21 @@ export default {
       subtree: true,
       childList: true,
       attributes: true,
-      attributeFilter: ['aria-label', 'aria-pressed', 'data-active', 'disabled'],
+      attributeFilter: ['aria-label', 'aria-pressed', 'data-active', 'disabled', 'data-chat-unfocused'],
     })
     syncPhase()
     const poll = window.setInterval(syncPhase, 250)
 
+    const unsubProfile = subscribeAtom(host.state.profile, resetForNewChat)
+    const unsubFocused = subscribeAtom(host.state.focusedSessionProfile, resetForNewChat)
+
     ctx.onDispose(() => {
       observer.disconnect()
       window.clearInterval(poll)
+      unsubProfile()
+      unsubFocused()
       persistAutoSend = () => {}
-      sending = false
-      $phase.set('idle')
+      resetForNewChat()
     })
 
     ctx.register({

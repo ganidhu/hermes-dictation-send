@@ -38,3 +38,4 @@ Done when Settings → Plugins shows Dictation send, and Ctrl+Shift+D toggles th
 - Status bar chip `mic send` / `mic edit` turns auto-send off.
 - Plugin clicks the real dictation control. A Hermes UI change can break it.
 - No speech = nothing sent.
+- Profile swaps remount the composer. The shortcut targets the focused chat and waits briefly if the new profile is still connecting.

@@ -31,3 +31,5 @@ The plugin clicks Hermes' own dictation button. If that control moves or gets re
 No speech means nothing gets sent.
 
 If the composer folds voice into a menu, the shortcut opens that menu first. A bit clumsy. Still works.
+
+Switching Hermes profiles remounts the chat. The shortcut waits a couple seconds for the new composer. If that profile's speech-to-text is not up yet, you get a toast instead of a silent miss.
